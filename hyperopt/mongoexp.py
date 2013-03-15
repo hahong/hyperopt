@@ -133,6 +133,11 @@ finalize the job in the database.
 __authors__ = ["James Bergstra", "Dan Yamins"]
 __license__ = "3-clause BSD License"
 __contact__ = "github.com/jaberg/hyperopt"
+DEFAULT_FIELDS = ['refresh_time', 'book_time', 'misc', 'state', 
+    '_attachments', 'tid', 'exp_key', 'version', 'owner', 'spec',
+    'result.status', 'result.loss', 'result.loss_variance', 
+    'result.true_loss', 'result.true_loss_variance', 'result.failure',
+    'result.spec']
 
 import copy
 import cPickle
@@ -358,7 +363,7 @@ class MongoJobs(object):
         return cls(db, coll, gfs, connection, tunnel, config_name)
 
     def __iter__(self):
-        return self.jobs.find()
+        return self.jobs.find(fields=DEFAULT_FIELDS)
 
     def __len__(self):
         try:
@@ -380,17 +385,17 @@ class MongoJobs(object):
         self.create_drivers_indexes()
 
     def jobs_complete(self, cursor=False):
-        c = self.jobs.find(spec=dict(state=JOB_STATE_DONE))
+        c = self.jobs.find(spec=dict(state=JOB_STATE_DONE), fields=DEFAULT_FIELDS)
         return c if cursor else list(c)
 
     def jobs_error(self, cursor=False):
-        c = self.jobs.find(spec=dict(state=JOB_STATE_ERROR))
+        c = self.jobs.find(spec=dict(state=JOB_STATE_ERROR), fields=DEFAULT_FIELDS)
         return c if cursor else list(c)
 
     def jobs_running(self, cursor=False):
         if cursor:
             raise NotImplementedError()
-        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING)))
+        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING), fields=DEFAULT_FIELDS))
         #TODO: mark some as MIA
         rval = [r for r in rval if not r.get('MIA', False)]
         return rval
@@ -398,13 +403,13 @@ class MongoJobs(object):
     def jobs_dead(self, cursor=False):
         if cursor:
             raise NotImplementedError()
-        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING)))
+        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING), fields=DEFAULT_FIELDS))
         #TODO: mark some as MIA
         rval = [r for r in rval if r.get('MIA', False)]
         return rval
 
     def jobs_queued(self, cursor=False):
-        c = self.jobs.find(spec=dict(state=JOB_STATE_NEW))
+        c = self.jobs.find(spec=dict(state=JOB_STATE_NEW), fields=DEFAULT_FIELDS)
         return c if cursor else list(c)
 
     def insert(self, job, safe=True):
@@ -548,7 +553,7 @@ class MongoJobs(object):
 
     def attachment_names(self, doc):
         def as_str(name_id):
-            assert isinstance(name_id[0], basestring), name
+            assert isinstance(name_id[0], basestring), name_id
             return str(name_id[0])
         return map(as_str, doc.get('_attachments', []))
 
@@ -723,7 +728,7 @@ class MongoTrials(Trials):
                 num_new = len(update_ids)
                 update_query = copy.deepcopy(query)
                 update_query['_id'] = {'$in': update_ids}
-                updated_trials = list(self.handle.jobs.find(update_query))
+                updated_trials = list(self.handle.jobs.find(update_query, fields=DEFAULT_FIELDS))
                 _trials.extend(updated_trials)
             else:
                 num_new = 0
@@ -731,7 +736,7 @@ class MongoTrials(Trials):
         else:
             #this case is for performance, though should be able to be removed
             #without breaking correctness. 
-            _trials = list(self.handle.jobs.find(query))
+            _trials = list(self.handle.jobs.find(query, fields=DEFAULT_FIELDS))
             if _trials:
                 _trials = [_trials[_i] for _i in get_most_recent_inds(_trials)]
             num_new = len(_trials)

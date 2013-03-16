@@ -30,7 +30,6 @@ __authors__   = "James Bergstra"
 __license__   = "3-clause BSD License"
 __contact__   = "github.com/jaberg/hyperopt"
 
-import copy
 import hashlib
 import logging
 import time
@@ -45,11 +44,13 @@ from bson import ObjectId
 import pyll
 from pyll import scope
 from pyll.stochastic import recursive_set_rng_kwarg
-from .pyll_utils import hp_choice
 
+from .exceptions import DuplicateLabel
+from .exceptions import InvalidTrial
+from .pyll_utils import hp_choice
 from .utils import pmin_sampled
+from .utils import use_obj_for_literal_in_memo
 from .vectorize import VectorizeHelper
-from .vectorize import replace_repeat_stochastic
 
 logger = logging.getLogger(__name__)
 
@@ -120,35 +121,42 @@ def StopExperiment(*args, **kwargs):
 
 
 def SONify(arg, memo=None):
-    if memo is None:
-        memo = {}
-    if id(arg) in memo:
-        rval = memo[id(arg)]
-    if isinstance(arg, ObjectId):
-        rval = arg
-    elif isinstance(arg, datetime.datetime):
-        rval = arg
-    elif isinstance(arg, np.floating):
-        rval = float(arg)
-    elif isinstance(arg, np.integer):
-        rval = int(arg)
-    elif isinstance(arg, (list, tuple)):
-        rval = type(arg)([SONify(ai, memo) for ai in arg])
-    elif isinstance(arg, dict):
-        rval = dict([(SONify(k, memo), SONify(v, memo))
-            for k, v in arg.items()])
-    elif isinstance(arg, (basestring, float, int, type(None))):
-        rval = arg
-    elif isinstance(arg, np.ndarray):
-        if arg.ndim == 0:
-            rval = SONify(arg.sum())
+    add_arg_to_raise = True
+    try:
+        if memo is None:
+            memo = {}
+        if id(arg) in memo:
+            rval = memo[id(arg)]
+        if isinstance(arg, ObjectId):
+            rval = arg
+        elif isinstance(arg, datetime.datetime):
+            rval = arg
+        elif isinstance(arg, np.floating):
+            rval = float(arg)
+        elif isinstance(arg, np.integer):
+            rval = int(arg)
+        elif isinstance(arg, (list, tuple)):
+            rval = type(arg)([SONify(ai, memo) for ai in arg])
+        elif isinstance(arg, dict):
+            rval = dict([(SONify(k, memo), SONify(v, memo))
+                for k, v in arg.items()])
+        elif isinstance(arg, (basestring, float, int, long, type(None))):
+            rval = arg
+        elif isinstance(arg, np.ndarray):
+            if arg.ndim == 0:
+                rval = SONify(arg.sum())
+            else:
+                rval = map(SONify, arg) # N.B. memo None
+        # -- put this after ndarray because ndarray not hashable
+        elif arg in (True, False):
+            rval = int(arg)
         else:
-            rval = map(SONify, arg) # N.B. memo None
-    # -- put this after ndarray because ndarray not hashable
-    elif arg in (True, False):
-        rval = int(arg)
-    else:
-        raise TypeError('SONify', arg)
+            add_arg_to_raise = False
+            raise TypeError('SONify', arg)
+    except Exception, e:
+        if add_arg_to_raise:
+            e.args = e.args + (arg,)
+        raise
     memo[id(rval)] = rval
     return rval
 
@@ -228,10 +236,6 @@ def spec_from_misc(misc):
     return spec
 
 
-class InvalidTrial(Exception):
-    pass
-
-
 class Trials(object):
     """
     Trials are documents (dict-like) with *at least* the following keys:
@@ -269,8 +273,10 @@ class Trials(object):
 
     def trial_attachments(self, trial):
         """
-        Support syntax for load:  self.attachments[name]
-        Support syntax for store: self.attachments[name] = value
+        Support syntax for load:  self.trial_attachments(doc)[name]
+        # -- does this work syntactically?
+        #    (In any event a 2-stage store will work)
+        Support syntax for store: self.trial_attachments(doc)[name] = value
         """
 
         # don't offer more here than in MongoCtrl
@@ -368,6 +374,9 @@ class Trials(object):
             print "CANT ENCODE"
             print '-' * 80
             raise
+        if trial['exp_key'] != self._exp_key:
+            raise InvalidTrial('wrong exp_key',
+                               (trial['exp_key'], self._exp_key))
         # XXX how to assert that tids are unique?
         return trial
 
@@ -541,6 +550,24 @@ class Trials(object):
             avg_true_loss = (pmin * loss3[:cutoff, 2]).sum()
             return avg_true_loss
 
+    @property
+    def best_trial(self):
+        results = self.results
+        best = np.argmin([r.get('loss', float('inf')) for r in results])
+        return self.trials[best]
+
+    @property
+    def argmin(self):
+        best_trial = self.best_trial
+        vals = best_trial['misc']['vals']
+        # unpack the one-element lists to values
+        # and skip over the 0-element lists
+        rval = {}
+        for k, v in vals.items():
+            if v:
+                rval[k] = v[0]
+        return rval
+
 
 def trials_from_docs(docs, validate=True, **kwargs):
     """Construct a Trials base class instance from a list of trials documents
@@ -575,7 +602,9 @@ class Ctrl(object):
         self.current_trial = current_trial
 
     def checkpoint(self, r=None):
-        pass
+        assert self.current_trial in self.trials._trials
+        if r is not None:
+            self.current_trial['result'] = r
 
     @property
     def attachments(self):
@@ -617,35 +646,47 @@ class Bandit(object):
     evaluate - interruptible/checkpt calling convention for evaluation routine
 
     """
-    pyll_ctrl = pyll.as_apply(None)
+    # -- the Ctrl object is not used directly, but rather
+    #    a live Ctrl instance is inserted for the pyll_ctrl
+    #    in self.evaluate so that it can be accessed from within
+    #    the pyll graph describing the search space.
+    pyll_ctrl = pyll.as_apply(Ctrl)
+
+    exceptions = []
 
     def __init__(self, expr,
             name=None,
             rseed=None,
             loss_target=None,
             exceptions=None,
+            do_checks=True,
             ):
-        if isinstance(expr, pyll.Apply):
-            self.expr = expr
-            # XXX: verify that expr is a dictionary with the right keys,
-            #      then refactor the code below
-        elif isinstance(expr, dict):
-            if 'loss' not in expr:
-                raise ValueError('expr must define a loss')
-            if 'status' not in expr:
-                expr['status'] = STATUS_OK
-            self.expr = pyll.as_apply(expr)
+
+        if do_checks:
+            if isinstance(expr, pyll.Apply):
+                self.expr = expr
+                # XXX: verify that expr is a dictionary with the right keys,
+                #      then refactor the code below
+            elif isinstance(expr, dict):
+                if 'loss' not in expr:
+                    raise ValueError('expr must define a loss')
+                if 'status' not in expr:
+                    expr['status'] = STATUS_OK
+                self.expr = pyll.as_apply(expr)
+            else:
+                raise TypeError('expr must be a dictionary')
         else:
-            raise TypeError('expr must be a dictionary')
+            self.expr = pyll.as_apply(expr)
 
         self.params =  {}
         for node in pyll.dfs(self.expr):
             if node.name == 'hyperopt_param':
-                self.params[node.arg['label'].obj] = node.arg['obj']
+                label = node.arg['label'].obj
+                if label in self.params:
+                    raise DuplicateLabel(label)
+                self.params[label] = node.arg['obj']
 
-        if exceptions is None:
-            self.exceptions = []
-        else:
+        if exceptions is not None:
             self.exceptions = exceptions
         self.loss_target = loss_target
         self.installed_rng = False
@@ -671,11 +712,14 @@ class Bandit(object):
     def short_str(self):
         return self.__class__.__name__
 
+    def use_obj_for_literal_in_memo(self, obj, lit, memo):
+        return use_obj_for_literal_in_memo(self.expr, obj, lit, memo)
+
     def evaluate(self, config, ctrl):
         """Return a result document
         """
         memo = self.memo_from_config(config)
-        memo[self.pyll_ctrl] = ctrl
+        self.use_obj_for_literal_in_memo(ctrl, Ctrl, memo)
         if self.rng is not None and not self.installed_rng:
             # -- N.B. this modifies the expr graph in-place
             #    XXX this feels wrong
@@ -1015,3 +1059,5 @@ class Experiment(object):
             if qlen:
                 msg = 'Exiting run, not waiting for %d jobs.' % qlen
                 logger.info(msg)
+
+

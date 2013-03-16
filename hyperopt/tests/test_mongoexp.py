@@ -11,6 +11,7 @@ if 0:
     copy_reg._reduce_ex = my_reduce_ex
 
 import cPickle
+import functools
 import os
 import signal
 import subprocess
@@ -27,7 +28,6 @@ from hyperopt import Random
 from hyperopt.bandits import gauss_wave2
 from hyperopt.base import RandomStop
 from hyperopt.base import JOB_STATE_DONE
-#from hyperopt.base import CoinFlipInjector
 from hyperopt.mongoexp import BanditSwapError
 from hyperopt.mongoexp import MongoTrials
 from hyperopt.mongoexp import MongoWorker
@@ -124,6 +124,19 @@ class TempMongo(object):
         except:  # XXX: don't know what exceptions to put here
             return False
 
+# -- If we can't create a TempMongo instance, then
+#    simply print what happened, 
+try:
+    with TempMongo() as temp_mongo:
+        pass
+except OSError, e:
+    print >> sys.stderr, e
+    print >> sys.stderr, ("Failed to create a TempMongo context,"
+        " skipping all mongo tests.")
+    if "such file" in str(e):
+        print >> sys.stderr, "Hint: is mongod executable on path?"
+    raise nose.SkipTest()
+
 
 class TestMongoTrials(hyperopt.tests.test_base.TestTrials):
     def setUp(self):
@@ -137,22 +150,24 @@ class TestMongoTrials(hyperopt.tests.test_base.TestTrials):
         self.temp_mongo.__exit__(*args)
 
 
-def with_mongo_trials(f):
+def with_mongo_trials(f, exp_key=None):
     def wrapper():
         with TempMongo() as temp_mongo:
             trials = MongoTrials(temp_mongo.connection_string('foo'),
-                    exp_key=None)
+                    exp_key=exp_key)
             print(len(trials.results))
             f(trials)
     wrapper.__name__ = f.__name__
     return wrapper
 
 
-def _worker_thread_fn(host_id, n_jobs, timeout, dbname='foo'):
-    mw = MongoWorker(mj=TempMongo.mongo_jobs(dbname))
+def _worker_thread_fn(host_id, n_jobs, timeout, dbname='foo', logfilename=None):
+    mw = MongoWorker(
+        mj=TempMongo.mongo_jobs(dbname),
+        logfilename=logfilename)
     try:
         while n_jobs:
-            mw.run_one(host_id, timeout)
+            mw.run_one(host_id, timeout, erase_created_workdir=True)
             print 'worker: %s ran job' % str(host_id)
             n_jobs -= 1
     except ReserveTimeout:
@@ -254,9 +269,11 @@ class TestExperimentWithThreads(unittest.TestCase):
 
     @staticmethod
     def worker_thread_fn(host_id, n_jobs, timeout):
-        mw = MongoWorker(mj=TempMongo.mongo_jobs('foodb'))
+        mw = MongoWorker(
+            mj=TempMongo.mongo_jobs('foodb'),
+            logfilename=None)
         while n_jobs:
-            mw.run_one(host_id, timeout)
+            mw.run_one(host_id, timeout, erase_created_workdir=True)
             print 'worker: %s ran job' % str(host_id)
             n_jobs -= 1
 
@@ -416,11 +433,15 @@ def test_main_search_runs(trials):
     main_search_helper(options, args)
 
 
-@with_mongo_trials
+@functools.partial(with_mongo_trials, exp_key='hello')
 def test_main_search_clear_existing(trials):
+    # -- main_search (the CLI) has no way of specifying an
+    #    exp_key of None.
+    assert trials._exp_key == 'hello'
     doc = hyperopt.tests.test_base.ok_trial(70, 0)
     doc['exp_key'] = 'hello'
     trials.insert_trial_doc(doc)
+    print 'Setting up trials with exp_key', doc['exp_key']
     options = FakeOptions(
             bandit_argfile='',
             bandit_algo_argfile='',
@@ -466,7 +487,7 @@ def test_main_search_driver_attachment(trials):
 
 
 @nose.tools.raises(BanditSwapError)
-@with_mongo_trials
+@functools.partial(with_mongo_trials, exp_key='hello')
 def test_main_search_driver_reattachment(trials):
     # pretend we already attached a different bandit
     trials.attachments['driver_attachment_hello.pkl'] = cPickle.dumps(
@@ -490,6 +511,11 @@ def test_main_search_driver_reattachment(trials):
 @with_mongo_trials
 @with_worker_threads(3, 'foo', timeout=5.0)
 def test_injector(trials):
+    # -- test is disabled because CoinFlipInjector is gone
+    # The point of the test would be to ensure that there is no problem
+    # submitting jobs from worker processes.
+
+    CoinFlipInjector = None # XXX find old def with `git grep`
     bandit_algo = hyperopt.Random(CoinFlipInjector(),
                  cmd=('bandit_json evaluate','hyperopt.base.CoinFlipInjector'))
     # -- also test that injections from a particular experiment (exp_key)

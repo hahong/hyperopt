@@ -14,20 +14,16 @@ packages = None
 package_name = None
 package_data = None
 scripts = None
-requirements_file = None
-requirements = None
-dependency_links = None
-
 # ---------------------
 
 
 # ----- control flags -----
 
 # fallback to setuptools if distribute isn't found
-setup_tools_fallback = False
+setup_tools_fallback = True
 
 # don't include subdir named 'tests' in package_data
-skip_tests = True
+skip_tests = False
 
 # print some extra debugging info
 debug = True
@@ -113,37 +109,6 @@ def find_package_data(packages):
             package_data[package] += subdir_findall(package_to_path(package), subdir)
     return package_data
 
-def parse_requirements(file_name):
-    """
-    from:
-        http://cburgmer.posterous.com/pip-requirementstxt-and-setuppy
-    """
-    requirements = []
-    with open(file_name, 'r') as f:
-        for line in f:
-            if re.match(r'(\s*#)|(\s*$)', line): continue
-            if re.match(r'\s*-e\s+', line):
-                requirements.append(re.sub(r'\s*-e\s+.*#egg=(.*)$',\
-                        r'\1', line).strip())
-            elif re.match(r'\s*-f\s+', line):
-                pass
-            else:
-                requirements.append(line.strip())
-    return requirements
-
-def parse_dependency_links(file_name):
-    """
-    from:
-        http://cburgmer.posterous.com/pip-requirementstxt-and-setuppy
-    """
-    dependency_links = []
-    with open(file_name) as f:
-        for line in f:
-            if re.match(r'\s*-[ef]\s+', line):
-                dependency_links.append(re.sub(r'\s*-[ef]\s+',\
-                        '', line))
-    return dependency_links
-
 # ----------- Override defaults here ----------------
 if packages is None: packages = setuptools.find_packages()
 
@@ -155,44 +120,35 @@ if package_data is None: package_data = find_package_data(packages)
 
 if scripts is None: scripts = find_scripts()
 
-if requirements_file is None:
-    requirements_file = 'requirements.txt'
-
-if os.path.exists(requirements_file):
-    if requirements is None:
-        requirements = parse_requirements(requirements_file)
-    if dependency_links is None:
-        dependency_links = parse_dependency_links(requirements_file)
-else:
-    if requirements is None:
-        requirements = []
-    if dependency_links is None:
-        dependency_links = []
-
-if debug:
-    logging.debug("Module name: %s" % package_name)
-    for package in packages:
-        logging.debug("Package: %s" % package)
-        logging.debug("\tData: %s" % str(package_data[package]))
-    logging.debug("Scripts:")
-    for script in scripts:
-        logging.debug("\tScript: %s" % script)
-    logging.debug("Requirements:")
-    for req in requirements:
-        logging.debug("\t%s" % req)
-    logging.debug("Dependency links:")
-    for dl in dependency_links:
-        logging.debug("\t%s" % dl)
-
 setuptools.setup(
     name = package_name,
-    version = 'dev',
+    version = '0.0.1',
     packages = packages,
     scripts = scripts,
-    
+    url = 'http://jaberg.github.com/hyperopt/',
+    author = 'James Bergstra',
+    author_email = 'anon@anon.com',
+    description = 'Distributed Asynchronous Hyperparameter Optimization',
+    long_description = open('README.txt').read(),
+    classifiers = [
+        'Development Status :: 3 - Alpha',
+        'Intended Audience :: Education',
+        'Intended Audience :: Science/Research',
+        'Intended Audience :: Developers',
+        'Environment :: Console',
+        'License :: OSI Approved :: BSD License',
+        'Operating System :: MacOS :: MacOS X',
+        'Operating System :: Microsoft :: Windows',
+        'Operating System :: POSIX',
+        'Operating System :: Unix',
+        'Programming Language :: Python',
+        'Topic :: Scientific/Engineering',
+        'Topic :: Software Development',
+    ],
+    platforms = ['Linux', 'OS-X', 'Windows'],
+    license = 'BSD',
+    keywords = 'Bayesian optimization hyperparameter model selection',
     package_data = package_data,
     include_package_data = True,
-
-    install_requires = requirements,
-    dependency_links = dependency_links
+    install_requires = ['numpy', 'scipy', 'nose', 'pymongo', 'networkx'],
 )

@@ -1,25 +1,20 @@
 import copy
-import sys
 import unittest
 import numpy as np
 import nose
 import bson
 
-from pyll import as_apply, scope, rec_eval, clone, dfs
+from hyperopt.pyll import as_apply, scope
 uniform = scope.uniform
 normal = scope.normal
 one_of = scope.one_of
 
-from hyperopt import STATUS_STRINGS
-from hyperopt import STATUS_OK
 from hyperopt.base import JOB_STATE_NEW
 from hyperopt.base import JOB_STATE_ERROR
 from hyperopt.base import TRIAL_KEYS
 from hyperopt.base import TRIAL_MISC_KEYS
-from hyperopt.base import StopExperiment
 from hyperopt.base import Bandit
 from hyperopt.base import coin_flip
-from hyperopt.base import Ctrl
 from hyperopt.base import Experiment
 from hyperopt.base import InvalidTrial
 from hyperopt.base import miscs_to_idxs_vals
@@ -50,7 +45,7 @@ def ok_trial(tid, *args, **kwargs):
         version=0,
         book_time=None,
         refresh_time=None,
-        exp_key='my_experiment',
+        exp_key=None,
         )
 
 
@@ -137,33 +132,47 @@ class TestRandom(unittest.TestCase):
         idxs, vals = miscs_to_idxs_vals(trials.miscs)
         assert idxs['flip'] == [0]
 
-    def test_suggest_5(self):
-        docs = self.algo.suggest(range(5), Trials())
-        print docs
-        assert len(docs) == 5
+    def test_suggest_N(self, N=10):
+        assert N <= 10
+        docs = self.algo.suggest(range(N), Trials())
+        print 'docs', docs
+        assert len(docs) == N
         # -- assert validity of docs
         trials = trials_from_docs(docs)
         idxs, vals = miscs_to_idxs_vals(trials.miscs)
-        print idxs
-        print vals
+        print 'idxs', idxs
+        print 'vals', vals
         assert len(idxs) == 1
         assert len(vals) == 1
-        assert idxs['flip'] == range(5)
-        assert np.all(vals['flip'] == [1, 1, 0, 1, 0])
+        assert idxs['flip'] == range(N)
+        # -- only works when N == 5
+        assert np.all(vals['flip'] == [0, 1, 0, 0, 0, 0,  0, 1, 1, 0][:N])
 
-    def test_arbitrary_range(self):
-        new_ids = [-2, 0, 7, 'a', '007']
+    def test_arbitrary_range(self, N=10):
+        assert N <= 10
+        new_ids = [-2, 0, 7, 'a', '007', 66, 'a3', '899', 23, 2333][:N]
         docs = self.algo.suggest(new_ids, Trials())
         # -- assert validity of docs
         trials = trials_from_docs(docs)
         idxs, vals = miscs_to_idxs_vals(trials.miscs)
-        assert len(docs) == 5
+        assert len(docs) == N
         assert len(idxs) == 1
         assert len(vals) == 1
         print vals
         assert idxs['flip'] == new_ids
-        assert np.all(vals['flip'] == [0, 1, 0, 1, 1])
 
+        # -- assert that the random seed matches that of Jan 8/2013
+        assert np.all(vals['flip'] == [0, 1, 0, 0, 0, 0, 0, 1, 1, 0][:N])
+
+    def test_suggest_all(self):
+        for ii in range(1, 10):
+            self.setUp()
+            self.test_suggest_N(ii)
+
+    def test_arbitrary_all(self):
+        for ii in range(1, 10):
+            self.setUp()
+            self.test_arbitrary_range(ii)
 
 class TestCoinFlipExperiment(unittest.TestCase):
     def setUp(self):
@@ -185,7 +194,8 @@ class TestCoinFlipExperiment(unittest.TestCase):
         print self.trials.idxs
         print self.trials.vals
         assert self.trials.idxs['flip'] == [0, 1, 2]
-        assert self.trials.vals['flip'] == [1, 1, 0]
+        # -- assert that the random seed matches that of Jan 8/2013
+        assert self.trials.vals['flip'] == [0, 1, 0]
 
 
 class TestCoinFlipStopExperiment(unittest.TestCase):

@@ -146,12 +146,14 @@ import hashlib
 import logging
 import optparse
 import os
+import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
 import urlparse
+import warnings
 
 import numpy
 import pymongo
@@ -184,6 +186,12 @@ class OperationFailure(Exception):
 
 
 class Shutdown(Exception):
+    """
+    Exception for telling mongo_worker loop to quit
+    """
+
+
+class WaitQuit(Exception):
     """
     Exception for telling mongo_worker loop to quit
     """
@@ -315,7 +323,7 @@ def coarse_utcnow():
     """
     # MongoDB stores only to the nearest millisecond
     # This is mentioned in a footnote here:
-    # http://api.mongodb.org/python/1.9%2B/api/bson/son.html#dt
+    # http://api.mongodb.org/python/current/api/bson/son.html#dt
     """
     now = datetime.datetime.utcnow()
     microsec = (now.microsecond//10**3)*(10**3)
@@ -438,9 +446,13 @@ class MongoJobs(object):
         """Delete all jobs and attachments"""
         try:
             for d in self.jobs.find(spec=cond, fields=['_id', '_attachments']):
-                for name, file_id in d.get('_attachments', []):
-                    self.gfs.delete(file_id)
                 logger.info('deleting job %s' % d['_id'])
+                for name, file_id in d.get('_attachments', []):
+                    try:
+                        self.gfs.delete(file_id)
+                    except gridfs.errors.NoFile:
+                        logger.error('failed to remove attachment %s:%s' % (
+                            name, file_id))
                 self.jobs.remove(d, safe=safe)
         except pymongo.errors.OperationFailure, e:
             raise OperationFailure(e)
@@ -500,12 +512,17 @@ class MongoJobs(object):
             collection = self.coll
 
         dct = copy.deepcopy(dct)
-        if '_id' in dct:
-            raise ValueError('cannot update the _id field')
-        if 'version' in dct:
-            raise ValueError('cannot update the version field')
         if '_id' not in doc:
             raise ValueError('doc must have an "_id" key to be updated')
+
+        if '_id' in dct:
+            if dct['_id'] != doc['_id']:
+                raise ValueError('cannot update the _id field')
+            del dct['_id']
+
+        if 'version' in dct:
+            if dct['version'] != doc['version']:
+                warnings.warn('Ignoring "version" field in update dictionary')
 
         if 'version' in doc:
             doc_query = dict(_id=doc['_id'], version=doc['version'])
@@ -641,6 +658,17 @@ class MongoTrials(Trials):
     As a concession to performance, this object permits trial filtering based
     on the exp_key, but I feel that's a hack. The case of `cmd` is similar--
     the exp_key and cmd are semantically coupled.
+
+    WRITING TO THE DATABASE
+    -----------------------
+    The trials object is meant for *reading* a trials database. Writing
+    to a database is different enough from writing to an in-memory
+    collection that no attempt has been made to abstract away that
+    difference.  If you want to update the documents within
+    a MongoTrials collection, then retrieve the `.handle` attribute (a
+    MongoJobs instance) and use lower-level methods, or pymongo's
+    interface directly.  When you are done writing, call refresh() or
+    refresh_tids() to bring the MongoTrials up to date.
     """
     async = True
     __find_kwargs__ = {'fields': DEFAULT_FIELDS}
@@ -668,7 +696,23 @@ class MongoTrials(Trials):
                 refresh=refresh)
         return rval
 
-    def refresh(self):
+    def refresh_tids(self, tids):
+        """ Sync documents with `['tid']` in the list of `tids` from the
+        database (not *to* the database).
+
+        Local trial documents whose tid is not in `tids` are not
+        affected by this call.  Local trial documents whose tid is in `tids` may
+        be:
+
+        * *deleted* (if db no longer has corresponding document), or
+        * *updated* (if db has an updated document) or,
+        * *left alone* (if db document matches local one).
+
+        Additionally, if the db has a matching document, but there is no
+        local trial with a matching tid, then the db document will be
+        *inserted* into the local collection.
+
+        """
         exp_key = self._exp_key
         if exp_key != None:
             query = {'exp_key' : exp_key}
@@ -676,7 +720,10 @@ class MongoTrials(Trials):
             query = {}
         t0 = time.time()
         query['state'] = {'$ne': JOB_STATE_ERROR}
-        _trials = getattr(self, '_trials', [])[:] #copy to make sure it doesn't get screwed up
+        if tids is not None:
+            query['tid'] = {'$in': list(tids)}
+        orig_trials = getattr(self, '_trials', [])
+        _trials = orig_trials[:] #copy to make sure it doesn't get screwed up
         if _trials:
             db_data = list(self.handle.jobs.find(query,
                                             fields=['_id', 'version']))
@@ -749,13 +796,27 @@ class MongoTrials(Trials):
         logger.debug('Refresh data download took %f seconds for %d ids' %
                          (time.time() - t0, num_new))
 
+        if tids is not None:
+            # -- If tids were given, then _trials only contains
+            #    documents with matching tids. Here we augment these
+            #    fresh matching documents, with our current ones whose
+            #    tids don't match.
+            new_trials = _trials
+            tids_set = set(tids)
+            assert all(t['tid'] in tids_set for t in new_trials)
+            old_trials = [t for t in orig_trials if t['tid'] not in tids_set]
+            _trials = new_trials + old_trials
+
+        # -- reassign new trials to self, in order of increasing tid
         jarray = numpy.array([j['_id'] for j in _trials])
         jobsort = jarray.argsort()
-  
         self._trials = [_trials[_idx] for _idx in jobsort]
         self._specs = [_trials[_idx]['spec'] for _idx in jobsort]
         self._results = [_trials[_idx]['result'] for _idx in jobsort]
         self._miscs = [_trials[_idx]['misc'] for _idx in jobsort]
+
+    def refresh(self):
+        self.refresh_tids(None)
 
     def _insert_trial_docs(self, docs):
         rval = []
@@ -780,16 +841,23 @@ class MongoTrials(Trials):
         rval = self.handle.jobs.find(query).count()
         return rval
 
-    def delete_all(self):
-        if self._exp_key:
-            cond = cond={'exp_key': self._exp_key}
-        else:
+    def delete_all(self, cond=None):
+        if cond is None:
             cond = {}
+        else:
+            cond = dict(cond)
+
+        if self._exp_key:
+            cond['exp_key'] = self._exp_key
         # -- remove all documents matching condition
         self.handle.delete_all(cond)
         gfs = self.handle.gfs
         for filename in gfs.list():
-            gfs.delete(gfs.get_last_version(filename)._id)
+            try:
+                fdoc = gfs.get_last_version(filename=filename, **cond)
+            except gridfs.errors.NoFile:
+                continue
+            gfs.delete(fdoc._id)
         self.refresh()
 
     def new_trial_ids(self, N):
@@ -808,11 +876,16 @@ class MongoTrials(Trials):
         # -- mongo docs say you can't upsert an empty document
         query = {'a': 0}
 
-        doc = db.job_ids.find_and_modify(
-                query,
-                {'$inc' : {'last_id': N}},
-                upsert=True,
-                safe=True)
+        doc = None
+        while doc is None:
+            doc = db.job_ids.find_and_modify(
+                    query,
+                    {'$inc' : {'last_id': N}},
+                    upsert=True,
+                    safe=True)
+            if doc is None:
+                logger.warning('no last_id found, re-trying')
+                time.sleep(1.0)
         lid = doc.get('last_id', 0)
         return range(lid, lid + N)
 
@@ -852,6 +925,15 @@ class MongoTrials(Trials):
             def __delitem__(_self, name):
                 raise NotImplementedError('delete trial_attachment')
 
+            def keys(self):
+                return [k for k in self]
+
+            def values(self):
+                return [self[k] for k in self]
+
+            def items(self):
+                return [(k, self[k]) for k in self]
+
         return Attachments()
 
     @property
@@ -863,25 +945,41 @@ class MongoTrials(Trials):
         Support syntax for store: self.attachments[name] = value
         """
         gfs = self.handle.gfs
+
+        query = {}
+        if self._exp_key:
+            query['exp_key'] = self._exp_key
+
         class Attachments(object):
+            def __iter__(_self):
+                if query:
+                    # -- gfs.list does not accept query kwargs
+                    #    (at least, as of pymongo 2.4)
+                    filenames = [fname
+                                 for fname in gfs.list()
+                                 if fname in _self]
+                else:
+                    filenames = gfs.list()
+                return iter(filenames)
+
             def __contains__(_self, name):
-                return gfs.exists(filename=name)
+                return gfs.exists(filename=name, **query)
 
             def __getitem__(_self, name):
                 try:
-                    rval = gfs.get_version(name).read()
+                    rval = gfs.get_version(filename=name, **query).read()
                     return rval
-                except gridfs.NoFile, e:
+                except gridfs.NoFile:
                     raise KeyError(name)
 
             def __setitem__(_self, name, value):
-                if gfs.exists(filename=name):
-                    gout = gfs.get_last_version(name)
+                if gfs.exists(filename=name, **query):
+                    gout = gfs.get_last_version(filename=name, **query)
                     gfs.delete(gout._id)
-                gfs.put(value, filename=name)
+                gfs.put(value, filename=name, **query)
 
             def __delitem__(_self, name):
-                gout = gfs.get_last_version(name)
+                gout = gfs.get_last_version(filename=name, **query)
                 gfs.delete(gout._id)
 
         return Attachments()
@@ -894,7 +992,9 @@ class MongoWorker(object):
     def __init__(self, mj,
             poll_interval=poll_interval,
             workdir=workdir,
-            exp_key=None):
+            exp_key=None,
+            logfilename='logfile.txt',
+            ):
         """
         mj - MongoJobs interface to jobs collection
         poll_interval - seconds
@@ -905,8 +1005,20 @@ class MongoWorker(object):
         self.poll_interval = poll_interval
         self.workdir = workdir
         self.exp_key = exp_key
+        self.logfilename = logfilename
 
-    def run_one(self, host_id=None, reserve_timeout=None):
+    def make_log_handler(self):
+        self.log_handler = logging.FileHandler(self.logfilename)
+        self.log_handler.setFormatter(
+            logging.Formatter(
+                fmt='%(levelname)s (%(name)s): %(message)s'))
+        self.log_handler.setLevel(logging.INFO)
+
+    def run_one(self,
+        host_id=None,
+        reserve_timeout=None,
+        erase_created_workdir=False,
+        ):
         if host_id == None:
             host_id = '%s:%i'%(socket.gethostname(), os.getpid()),
         job = None
@@ -940,12 +1052,33 @@ class MongoWorker(object):
             workdir = os.path.join(workdir, str(job['_id']))
         else:
             workdir = self.workdir
-        workdir = os.path.expanduser(workdir)
-        if not os.path.isdir(workdir):
-            os.makedirs(workdir)
+        workdir = os.path.abspath(os.path.expanduser(workdir))
         cwd = os.getcwd()
-        os.chdir(workdir)
+        sentinal = None
+        if not os.path.isdir(workdir):
+            # -- figure out the closest point to the workdir in the filesystem
+            closest_dir = ''
+            for wdi in os.path.split(workdir):
+                if os.path.isdir(os.path.join(closest_dir, wdi)):
+                    closest_dir = os.path.join(closest_dir, wdi)
+                else:
+                    break
+            assert closest_dir != workdir
+
+            # -- touch a sentinal file so that recursive directory
+            #    removal stops at the right place
+            sentinal = os.path.join(closest_dir, wdi + '.inuse')
+            logger.debug("touching sentinal file: %s" % sentinal)
+            open(sentinal, 'w').close()
+            # -- now just make the rest of the folders
+            logger.debug("making workdir: %s" % workdir)
+            os.makedirs(workdir)
         try:
+            root_logger = logging.getLogger()
+            if self.logfilename:
+                self.make_log_handler()
+                root_logger.addHandler(self.log_handler)
+
             cmd = job['misc']['cmd']
             cmd_protocol = cmd[0]
             try:
@@ -968,6 +1101,10 @@ class MongoWorker(object):
                     worker_fn = json_call(bandit_name,
                             args=bandit_args,
                             kwargs=bandit_kwargs).evaluate
+                elif cmd_protocol == 'domain_attachment':
+                    blob = ctrl.trials.attachments[cmd[1]]
+                    domain = cPickle.loads(blob)
+                    worker_fn = domain.evaluate
                 else:
                     raise ValueError('Unrecognized cmd protocol', cmd_protocol)
 
@@ -984,6 +1121,8 @@ class MongoWorker(object):
                         safe=True)
                 raise
         finally:
+            if self.logfilename:
+                root_logger.removeHandler(self.log_handler)
             os.chdir(cwd)
 
         logger.info('job finished: %s' % str(job['_id']))
@@ -995,6 +1134,20 @@ class MongoWorker(object):
             ctrl.attachments[aname] = aval
         ctrl.checkpoint(result)
         mj.update(job, {'state': JOB_STATE_DONE}, safe=True)
+
+        if sentinal:
+            if erase_created_workdir:
+                logger.debug('MongoWorker.run_one: rmtree %s' % workdir)
+                shutil.rmtree(workdir)
+                # -- put it back so that recursive removedirs works
+                os.mkdir(workdir)
+                # -- recursive backtrack to sentinal
+                logger.debug('MongoWorker.run_one: removedirs %s'
+                             % workdir)
+                os.removedirs(workdir)
+            # -- remove sentinal
+            logger.debug('MongoWorker.run_one: rm %s' % sentinal)
+            os.remove(sentinal)
 
 
 class MongoCtrl(Ctrl):
@@ -1068,9 +1221,15 @@ def main_worker_helper(options, args):
     def sighandler_shutdown(signum, frame):
         logger.info('Caught signal %i, shutting down.' % signum)
         raise Shutdown(signum)
+
+    def sighandler_wait_quit(signum, frame):
+        logger.info('Caught signal %i, shutting down.' % signum)
+        raise WaitQuit(signum)
+
     signal.signal(signal.SIGINT, sighandler_shutdown)
     signal.signal(signal.SIGHUP, sighandler_shutdown)
     signal.signal(signal.SIGTERM, sighandler_shutdown)
+    signal.signal(signal.SIGUSR1, sighandler_wait_quit)
 
     if N > 1:
         proc = None
@@ -1094,11 +1253,21 @@ def main_worker_helper(options, args):
                 proc = subprocess.Popen(sub_argv)
                 retcode = proc.wait()
                 proc = None
-            except Shutdown, e:
+
+            except Shutdown:
                 #this is the normal way to stop the infinite loop (if originally N=-1)
                 if proc:
                     #proc.terminate() is only available as of 2.6
                     os.kill(proc.pid, signal.SIGTERM)
+                    return proc.wait()
+                else:
+                    return 0
+
+            except WaitQuit:
+                # -- sending SIGUSR1 to a looping process will cause it to
+                # break out of the loop after the current subprocess finishes
+                # normally.
+                if proc:
                     return proc.wait()
                 else:
                     return 0
@@ -1122,8 +1291,7 @@ def main_worker_helper(options, args):
                 exp_key=options.exp_key)
         mworker.run_one(reserve_timeout=float(options.reserve_timeout))
     else:
-        parser.print_help()
-        return -1
+        raise ValueError("N <= 0")
 
 
 def main_worker():
@@ -1190,7 +1358,6 @@ def bandit_from_options(options):
             bandit_argfile_text)
 
 
-
 def algo_from_options(options, bandit):
     #
     # Construct algo
@@ -1236,7 +1403,13 @@ def expkey_from_options(options, bandit_stuff, algo_stuff):
 def main_search_helper(options, args, input=input, cmd_type=None):
     """
     input is an argument so that unittest can replace stdin
+
+    cmd_type can be set to "D.A." to force interpretation of bandit as driver
+    attachment. This mechanism is used by unit tests.
     """
+    assert getattr(options, 'bandit', None) is None
+    assert getattr(options, 'bandit_algo', None) is None
+    assert len(args) == 2
     options.bandit = args[0]
     options.bandit_algo = args[1]
 
@@ -1262,7 +1435,6 @@ def main_search_helper(options, args, input=input, cmd_type=None):
         y, n = 'y', 'n'
         if input() != 'y':
             print >> sys.stdout, "aborting"
-            del self
             return 1
         trials.delete_all()
 
@@ -1271,7 +1443,6 @@ def main_search_helper(options, args, input=input, cmd_type=None):
     #
     if bandit_argfile_text or algo_argfile_text or cmd_type=='D.A.':
         aname = 'driver_attachment_%s.pkl' % exp_key
-        worker_cmd = ('driver_attachment', aname)
         if aname in trials.attachments:
             atup = cPickle.loads(trials.attachments[aname])
             if bandit_NAK != atup:
@@ -1279,6 +1450,7 @@ def main_search_helper(options, args, input=input, cmd_type=None):
         else:
             blob = cPickle.dumps(bandit_NAK)
             trials.attachments[aname] = blob
+        worker_cmd = ('driver_attachment', aname)
     else:
         worker_cmd = ('bandit_json evaluate', bandit_name)
 
@@ -1404,7 +1576,7 @@ def main_show_helper(options, args):
         cPickle.dump(trials_from_docs(trials.trials),
                 open(args[1], 'w'))
     elif 'vars' == cmd:
-        return plotting.main_plot_vars(trials)
+        return plotting.main_plot_vars(trials, bandit=bandit)
     else:
         logger.error("Invalid cmd %s" % cmd)
         parser.print_help()

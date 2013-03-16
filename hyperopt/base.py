@@ -39,7 +39,7 @@ import sys
 import numpy as np
 
 import bson # -- comes with pymongo
-from bson.objectid import ObjectId
+from bson import ObjectId
 
 import pyll
 from pyll import scope

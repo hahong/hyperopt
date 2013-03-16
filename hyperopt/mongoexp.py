@@ -335,13 +335,16 @@ class MongoJobs(object):
     # db.gfs - file storage via gridFS for all collections
     #
     """
-    def __init__(self, db, jobs, gfs, conn, tunnel, config_name):
+    __find_kwargs__ = {'fields': DEFAULT_FIELDS}
+
+    def __init__(self, db, jobs, gfs, conn, tunnel, config_name, find_kwargs=__find_kwargs__):
         self.db = db
         self.jobs = jobs
         self.gfs = gfs
         self.conn=conn
         self.tunnel=tunnel
         self.config_name = config_name
+        self.find_kwargs = find_kwargs
 
     # TODO: rename jobs -> coll throughout
     coll = property(lambda s : s.jobs)
@@ -363,7 +366,7 @@ class MongoJobs(object):
         return cls(db, coll, gfs, connection, tunnel, config_name)
 
     def __iter__(self):
-        return self.jobs.find(fields=DEFAULT_FIELDS)
+        return self.jobs.find(**self.find_kwargs)
 
     def __len__(self):
         try:
@@ -385,17 +388,17 @@ class MongoJobs(object):
         self.create_drivers_indexes()
 
     def jobs_complete(self, cursor=False):
-        c = self.jobs.find(spec=dict(state=JOB_STATE_DONE), fields=DEFAULT_FIELDS)
+        c = self.jobs.find(spec=dict(state=JOB_STATE_DONE), **self.find_kwargs)
         return c if cursor else list(c)
 
     def jobs_error(self, cursor=False):
-        c = self.jobs.find(spec=dict(state=JOB_STATE_ERROR), fields=DEFAULT_FIELDS)
+        c = self.jobs.find(spec=dict(state=JOB_STATE_ERROR), **self.find_kwargs)
         return c if cursor else list(c)
 
     def jobs_running(self, cursor=False):
         if cursor:
             raise NotImplementedError()
-        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING), fields=DEFAULT_FIELDS))
+        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING), **self.find_kwargs))
         #TODO: mark some as MIA
         rval = [r for r in rval if not r.get('MIA', False)]
         return rval
@@ -403,13 +406,13 @@ class MongoJobs(object):
     def jobs_dead(self, cursor=False):
         if cursor:
             raise NotImplementedError()
-        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING), fields=DEFAULT_FIELDS))
+        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING), **self.find_kwargs))
         #TODO: mark some as MIA
         rval = [r for r in rval if r.get('MIA', False)]
         return rval
 
     def jobs_queued(self, cursor=False):
-        c = self.jobs.find(spec=dict(state=JOB_STATE_NEW), fields=DEFAULT_FIELDS)
+        c = self.jobs.find(spec=dict(state=JOB_STATE_NEW), **self.find_kwargs)
         return c if cursor else list(c)
 
     def insert(self, job, safe=True):
@@ -640,9 +643,11 @@ class MongoTrials(Trials):
     the exp_key and cmd are semantically coupled.
     """
     async = True
+    __find_kwargs__ = {'fields': DEFAULT_FIELDS}
 
     def __init__(self, arg, exp_key=None, cmd=None, workdir=None,
-            refresh=True):
+            refresh=True, find_kwargs=__find_kwargs__):
+        self.find_kwargs = find_kwargs
         if isinstance(arg, MongoJobs):
             self.handle = arg
         else:
@@ -728,7 +733,7 @@ class MongoTrials(Trials):
                 num_new = len(update_ids)
                 update_query = copy.deepcopy(query)
                 update_query['_id'] = {'$in': update_ids}
-                updated_trials = list(self.handle.jobs.find(update_query, fields=DEFAULT_FIELDS))
+                updated_trials = list(self.handle.jobs.find(update_query, **self.find_kwargs))
                 _trials.extend(updated_trials)
             else:
                 num_new = 0
@@ -736,7 +741,7 @@ class MongoTrials(Trials):
         else:
             #this case is for performance, though should be able to be removed
             #without breaking correctness. 
-            _trials = list(self.handle.jobs.find(query, fields=DEFAULT_FIELDS))
+            _trials = list(self.handle.jobs.find(query, **self.find_kwargs))
             if _trials:
                 _trials = [_trials[_i] for _i in get_most_recent_inds(_trials)]
             num_new = len(_trials)

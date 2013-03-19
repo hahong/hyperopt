@@ -374,7 +374,7 @@ class Trials(object):
             print "CANT ENCODE"
             print '-' * 80
             raise
-        if trial['exp_key'] != self._exp_key:
+        if self._exp_key is not None and trial['exp_key'] != self._exp_key:
             raise InvalidTrial('wrong exp_key',
                                (trial['exp_key'], self._exp_key))
         # XXX how to assert that tids are unique?
